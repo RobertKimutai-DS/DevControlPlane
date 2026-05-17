@@ -8,6 +8,40 @@ if (Test-Path $configFile) {
     $script:Config = Get-Content $configFile -Raw | ConvertFrom-Json
 }
 
+# Pattern definitions at module scope so parallel runspaces can receive them via $using:
+$script:PatternDefs = @(
+    @{
+        Name        = 'HardcodedDrivePath'
+        Regex       = "DriveNotFoundException.*drive with the name '([A-Z])'"
+        Diagnosis   = 'Absolute drive-letter path used in a script — fails on any runner that lacks that drive.'
+        Instruction = 'Replace all hardcoded drive-letter paths (e.g. E:\, C:\Users\...) with $PSScriptRoot-relative paths using Join-Path $PSScriptRoot.'
+    }
+    @{
+        Name        = 'ModuleNotFound'
+        Regex       = 'ModuleNotFoundError|module .+? was not loaded because no valid module|Could not load the module named .+?'
+        Diagnosis   = 'A required PowerShell module is missing on the runner.'
+        Instruction = 'Add an Install-Module step to the workflow YAML before the step that uses the module.'
+    }
+    @{
+        Name        = 'CommandNotFound'
+        Regex       = "The term '.+?' is not recognized as a name of a cmdlet"
+        Diagnosis   = 'A command or function is called before its module is imported.'
+        Instruction = 'Ensure the module that provides the missing command is imported before it is called.'
+    }
+    @{
+        Name        = 'FileNotFound'
+        Regex       = "Cannot find path '.+?'|cannot access '.+?'|ItemNotFoundException"
+        Diagnosis   = 'A script references a file path that does not exist on the runner.'
+        Instruction = 'Verify the file exists in the repo and the path is correct relative to the working directory.'
+    }
+    @{
+        Name        = 'SecretMissing'
+        Regex       = 'secret.*not set|GITHUB_TOKEN.*not set|A valid password is required'
+        Diagnosis   = 'A required secret or environment variable is not configured on the runner.'
+        Instruction = 'Add the secret in repo Settings > Secrets and reference it in the workflow env block.'
+    }
+)
+
 #region Private helpers
 
 function Get-GitHubToken {
@@ -31,41 +65,7 @@ function Get-WorkflowJobLogs {
 
 function Get-PatternFix {
     param([string]$LogText)
-
-    $patterns = @(
-        @{
-            Name        = 'HardcodedDrivePath'
-            Regex       = "DriveNotFoundException.*drive with the name '([A-Z])'"
-            Diagnosis   = 'Absolute drive-letter path used in a script — fails on any runner that lacks that drive.'
-            Instruction = 'Replace all hardcoded drive-letter paths (e.g. E:\, C:\Users\...) with $PSScriptRoot-relative paths using Join-Path $PSScriptRoot.'
-        }
-        @{
-            Name        = 'ModuleNotFound'
-            Regex       = "ModuleNotFoundError|module '(.+?)' was not loaded because no valid module|Could not load the module named '(.+?)'"
-            Diagnosis   = 'A required PowerShell module is missing on the runner.'
-            Instruction = 'Add an Install-Module step to the workflow YAML before the step that uses the module.'
-        }
-        @{
-            Name        = 'CommandNotFound'
-            Regex       = "The term '(.+?)' is not recognized as a name of a cmdlet"
-            Diagnosis   = 'A command or function is called before its module is imported.'
-            Instruction = 'Ensure the module that provides the missing command is imported before it is called.'
-        }
-        @{
-            Name        = 'FileNotFound'
-            Regex       = "Cannot find path '(.+?)'|cannot access '(.+?)'|ItemNotFoundException"
-            Diagnosis   = 'A script references a file path that does not exist on the runner.'
-            Instruction = 'Verify the file exists in the repo and the path is correct relative to the working directory.'
-        }
-        @{
-            Name        = 'SecretMissing'
-            Regex       = "secret.*not set|GITHUB_TOKEN.*not set|A valid password is required"
-            Diagnosis   = 'A required secret or environment variable is not configured on the runner.'
-            Instruction = 'Add the secret in repo Settings > Secrets and reference it in the workflow env block.'
-        }
-    )
-
-    foreach ($p in $patterns) {
+    foreach ($p in $script:PatternDefs) {
         if ($LogText -match $p.Regex) {
             return [PSCustomObject]@{
                 PatternName = $p.Name
@@ -221,26 +221,24 @@ function Get-DevWorkspaceStatus {
             Accept        = 'application/vnd.github+json'
         }
 
-        $githubResults = @(foreach ($repo in $repoList) {
+        # Build an index to restore original order after unordered parallel output
+        $repoIndex = @{}
+        for ($i = 0; $i -lt $repoList.Count; $i++) { $repoIndex[$repoList[$i]] = $i }
+
+        $githubResults = [array]($repoList | ForEach-Object -Parallel {
+            $repo = $_
+            $hdrs = $using:headers
             try {
-                $uri  = "https://api.github.com/repos/$repo/actions/runs?per_page=5"
                 $runs = @(
-                    (Invoke-RestMethod -Uri $uri -Headers $headers -Method Get -ErrorAction Stop).workflow_runs |
+                    (Invoke-RestMethod -Uri "https://api.github.com/repos/$repo/actions/runs?per_page=5" `
+                        -Headers $hdrs -Method Get -ErrorAction Stop).workflow_runs |
                     Select-Object -Property name, status, conclusion, created_at
                 )
-                [PSCustomObject]@{
-                    Repository = $repo
-                    Runs       = $runs
-                    Error      = $null
-                }
+                [PSCustomObject]@{ Repository = $repo; Runs = $runs; Error = $null }
             } catch {
-                [PSCustomObject]@{
-                    Repository = $repo
-                    Runs       = $null
-                    Error      = $_.Exception.Message
-                }
+                [PSCustomObject]@{ Repository = $repo; Runs = @(); Error = $_.Exception.Message }
             }
-        })
+        } -ThrottleLimit 5 | Sort-Object { $repoIndex[$_.Repository] })
     }
 
     [PSCustomObject]@{
@@ -455,46 +453,69 @@ function Get-WorkflowFailures {
         throw 'No repositories configured. Pass -Repository or set DevControlPlane.config.json.'
     }
 
-    $headers = @{ Authorization = "Bearer $token"; Accept = 'application/vnd.github+json' }
+    $headers     = @{ Authorization = "Bearer $token"; Accept = 'application/vnd.github+json' }
+    $patternDefs = $script:PatternDefs   # capture into local var for $using: access
 
-    [array]$failures = foreach ($repo in $repoList) {
+    [array]$failures = $repoList | ForEach-Object -Parallel {
+        $repo     = $_
+        $hdrs     = $using:headers
+        $tok      = $using:token
+        $maxR     = $using:MaxRuns
+        $patterns = $using:patternDefs
+
+        # Inline helpers (module private functions unavailable in parallel runspaces)
+        function _GetLogs { param($r,$jid,$t)
+            try {
+                Invoke-RestMethod -Uri "https://api.github.com/repos/$r/actions/jobs/$jid/logs" `
+                    -Headers @{ Authorization="Bearer $t"; Accept="application/vnd.github+json" } -ErrorAction Stop
+            } catch { "Log unavailable: $_" }
+        }
+        function _MatchPattern { param($log,$pats)
+            foreach ($p in $pats) {
+                if ($log -match $p.Regex) {
+                    return [PSCustomObject]@{ PatternName=$p.Name; Diagnosis=$p.Diagnosis; Instruction=$p.Instruction; Matched=$Matches[0] }
+                }
+            }
+            return $null
+        }
+
         try {
             $runs = (Invoke-RestMethod `
-                -Uri "https://api.github.com/repos/$repo/actions/runs?per_page=$MaxRuns&status=failure" `
-                -Headers $headers -ErrorAction Stop).workflow_runs
+                -Uri "https://api.github.com/repos/$repo/actions/runs?per_page=$maxR&status=failure" `
+                -Headers $hdrs -ErrorAction Stop).workflow_runs
 
             foreach ($run in $runs) {
                 $jobs = (Invoke-RestMethod `
                     -Uri "https://api.github.com/repos/$repo/actions/runs/$($run.id)/jobs" `
-                    -Headers $headers -ErrorAction Stop).jobs
+                    -Headers $hdrs -ErrorAction Stop).jobs
 
                 foreach ($job in ($jobs | Where-Object { $_.conclusion -eq 'failure' })) {
-                    $logText  = Get-WorkflowJobLogs -Repo $repo -JobId $job.id -Token $token
-                    $pattern  = Get-PatternFix -LogText $logText
+                    $logText  = _GetLogs $repo $job.id $tok
+                    $pattern  = _MatchPattern $logText $patterns
                     $failFile = if ($logText -match '[\\/]([\w.-]+\.ps1):\d+') { $Matches[1] } else { $null }
 
                     [PSCustomObject]@{
-                        Repository    = $repo
-                        RunId         = $run.id
-                        WorkflowName  = $run.name
-                        Branch        = $run.head_branch
-                        CommitSha     = $run.head_sha.Substring(0, 7)
-                        CreatedAt     = $run.created_at
-                        JobId         = $job.id
-                        JobName       = $job.name
-                        FailedSteps   = @($job.steps | Where-Object { $_.conclusion -eq 'failure' } | Select-Object -ExpandProperty name)
-                        LogExcerpt    = ($logText -split "`n" | Where-Object { $_ -match 'error|fail|exception|cannot|not found' } | Select-Object -First 15) -join "`n"
-                        FullLog       = $logText
-                        KnownPattern  = $pattern
-                        FailedFile    = $failFile
-                        HtmlUrl       = $run.html_url
+                        Repository   = $repo
+                        RunId        = $run.id
+                        WorkflowName = $run.name
+                        Branch       = $run.head_branch
+                        CommitSha    = $run.head_sha.Substring(0, 7)
+                        CreatedAt    = $run.created_at
+                        JobId        = $job.id
+                        JobName      = $job.name
+                        FailedSteps  = @($job.steps | Where-Object { $_.conclusion -eq 'failure' } | Select-Object -ExpandProperty name)
+                        LogExcerpt   = ($logText -split "`n" | Where-Object { $_ -match 'error|fail|exception|cannot|not found' } | Select-Object -First 15) -join "`n"
+                        FullLog      = $logText
+                        KnownPattern = $pattern
+                        FailedFile   = $failFile
+                        HtmlUrl      = $run.html_url
                     }
                 }
             }
         } catch {
             Write-Warning "Could not fetch failures for ${repo}: $_"
         }
-    }
+    } -ThrottleLimit 5
 
     if (-not $failures) {
         Write-Host 'No failed runs found across configured repositories.' -ForegroundColor Green
