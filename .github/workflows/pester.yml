@@ -1,0 +1,92 @@
+name: Pester Tests
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  test:
+    name: Run Pester Test Suite
+    runs-on: windows-latest
+
+    env:
+      GITHUB_REPOSITORY_TARGET: RobertKimutai-DS/Portfolio
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install PowerShell modules
+        shell: pwsh
+        run: |
+          Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
+          Install-Module Microsoft.PowerShell.SecretManagement -Scope CurrentUser -Force
+          Install-Module Microsoft.PowerShell.SecretStore       -Scope CurrentUser -Force
+          Install-Module Pode                                   -Scope CurrentUser -Force
+          Install-Module Pester -Scope CurrentUser -Force -SkipPublisherCheck
+          Write-Host "Pester     : $((Get-Module Pester -ListAvailable | Select-Object -First 1).Version)"
+          Write-Host "SecretMgmt : $((Get-Module Microsoft.PowerShell.SecretManagement -ListAvailable | Select-Object -First 1).Version)"
+          Write-Host "Pode       : $((Get-Module Pode -ListAvailable | Select-Object -First 1).Version)"
+
+      - name: Set up SecretStore vault
+        shell: pwsh
+        run: |
+          Import-Module Microsoft.PowerShell.SecretManagement, Microsoft.PowerShell.SecretStore -Force
+          Reset-SecretStore -Authentication None -Interaction None -Confirm:$false -Force
+          Register-SecretVault -Name DevVault -ModuleName Microsoft.PowerShell.SecretStore -DefaultVault -ErrorAction SilentlyContinue
+
+          # Use the repo PAT secret if available, otherwise store a placeholder
+          $token = '${{ secrets.GH_PAT }}'
+          if ($token -and $token -ne '') {
+            Set-Secret -Name GitHubToken -Secret $token -Vault DevVault
+            Write-Host "GitHub token stored in DevVault"
+          } else {
+            Set-Secret -Name GitHubToken -Secret 'placeholder' -Vault DevVault
+            Write-Host "No GH_PAT secret found — GitHub Actions API tests will be skipped gracefully"
+          }
+
+      - name: Copy module to PSModulePath
+        shell: pwsh
+        run: |
+          $dst = "$HOME\Documents\PowerShell\Modules\DevControlPlane\1.1.0"
+          New-Item -ItemType Directory -Path $dst -Force | Out-Null
+          Copy-Item DevControlPlane.psd1, DevControlPlane.psm1, Start-ControlPanel.ps1,
+                    Invoke-ClaudeContext.ps1, DevControlPlane.config.json $dst -Force
+          Write-Host "Module installed to $dst"
+
+      - name: Run Pester tests
+        shell: pwsh
+        env:
+          GITHUB_REPOSITORY: ${{ env.GITHUB_REPOSITORY_TARGET }}
+        run: |
+          Import-Module Pester -MinimumVersion 5.0 -Force
+          Import-Module DevControlPlane -Force
+
+          $cfg = New-PesterConfiguration
+          $cfg.Run.Path            = '.\DevControlPlane.Tests.ps1'
+          $cfg.Output.Verbosity    = 'Detailed'
+          $cfg.Run.PassThru        = $true
+          $cfg.TestResult.Enabled  = $true
+          $cfg.TestResult.OutputPath = 'test-results.xml'
+          $cfg.TestResult.OutputFormat = 'NUnitXml'
+
+          $result = Invoke-Pester -Configuration $cfg
+
+          Write-Host ""
+          Write-Host "Passed : $($result.PassedCount)"
+          Write-Host "Failed : $($result.FailedCount)"
+          Write-Host "Skipped: $($result.SkippedCount)"
+
+          if ($result.FailedCount -gt 0) {
+            Write-Error "One or more Pester tests failed."
+            exit 1
+          }
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pester-test-results
+          path: test-results.xml
