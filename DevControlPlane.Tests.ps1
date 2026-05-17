@@ -26,8 +26,8 @@ Describe 'Module Manifest' {
         $script:manifest.FunctionsToExport | Should -Contain 'Start-ControlPanel'
     }
 
-    It 'exports exactly 3 functions' {
-        $script:manifest.FunctionsToExport.Count | Should -Be 3
+    It 'exports exactly 5 functions' {
+        $script:manifest.FunctionsToExport.Count | Should -Be 5
     }
 
     It 'has a valid GUID format' {
@@ -180,5 +180,64 @@ Describe 'Start-ControlPanel port validation' {
         $cmd = Get-Command Start-ControlPanel
         $portParam = $cmd.Parameters['Port']
         $portParam | Should -Not -BeNullOrEmpty
+    }
+}
+
+# ---------------------------------------------------------------------------
+Describe 'Get-WorkflowFailures' {
+
+    It 'is exported by the module' {
+        Get-Command Get-WorkflowFailures -Module DevControlPlane | Should -Not -BeNullOrEmpty
+    }
+
+    It 'accepts -Repository parameter' {
+        $cmd = Get-Command Get-WorkflowFailures
+        $cmd.Parameters.ContainsKey('Repository') | Should -BeTrue
+    }
+
+    It 'accepts -MaxRuns parameter' {
+        $cmd = Get-Command Get-WorkflowFailures
+        $cmd.Parameters.ContainsKey('MaxRuns') | Should -BeTrue
+    }
+
+    It 'rejects invalid repository format' {
+        { Get-WorkflowFailures -Repository 'no-slash-here' } | Should -Throw
+    }
+
+    It 'returns array or null when querying a valid repo with no failures' {
+        # This test is safe -- returns empty if no failures, never throws on valid repo
+        $result = Get-WorkflowFailures -Repository 'RobertKimutai-DS/DevControlPlane'
+        # Result is either $null/empty or a PSCustomObject array
+        ($null -eq $result -or $result -is [array] -or $result -is [PSCustomObject]) | Should -BeTrue
+    }
+}
+
+# ---------------------------------------------------------------------------
+Describe 'Repair-FailedWorkflow' {
+
+    It 'is exported by the module' {
+        Get-Command Repair-FailedWorkflow -Module DevControlPlane | Should -Not -BeNullOrEmpty
+    }
+
+    It 'accepts -RepoPath parameter' {
+        $cmd = Get-Command Repair-FailedWorkflow
+        $cmd.Parameters.ContainsKey('RepoPath') | Should -BeTrue
+    }
+
+    It 'accepts -AutoCommit switch' {
+        $cmd = Get-Command Repair-FailedWorkflow
+        $cmd.Parameters.ContainsKey('AutoCommit') | Should -BeTrue
+    }
+
+    It 'supports -WhatIf via SupportsShouldProcess' {
+        $cmd = Get-Command Repair-FailedWorkflow
+        $cmd.Parameters.ContainsKey('WhatIf') | Should -BeTrue
+    }
+
+    It 'requires -Failure parameter (Mandatory)' {
+        $cmd = Get-Command Repair-FailedWorkflow
+        $cmd.Parameters['Failure'].Attributes |
+            Where-Object { $_ -is [System.Management.Automation.ParameterAttribute] } |
+            Select-Object -ExpandProperty Mandatory | Should -BeTrue
     }
 }

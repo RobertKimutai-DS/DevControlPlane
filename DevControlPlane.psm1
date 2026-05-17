@@ -10,6 +10,100 @@ if (Test-Path $configFile) {
 
 #region Private helpers
 
+function Get-GitHubToken {
+    $token = $null
+    try { $token = Get-Secret -Name GitHubToken -Vault DevVault -AsPlainText -ErrorAction Stop } catch { }
+    if (-not $token) { $token = $env:GITHUB_TOKEN }
+    $token
+}
+
+function Get-WorkflowJobLogs {
+    param([string]$Repo, [string]$JobId, [string]$Token)
+    try {
+        $headers  = @{ Authorization = "Bearer $Token"; Accept = 'application/vnd.github+json' }
+        $logText  = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/actions/jobs/$JobId/logs" `
+                        -Headers $headers -Method Get -ErrorAction Stop
+        return $logText
+    } catch {
+        return "Log unavailable: $_"
+    }
+}
+
+function Get-PatternFix {
+    param([string]$LogText)
+
+    $patterns = @(
+        @{
+            Name        = 'HardcodedDrivePath'
+            Regex       = "DriveNotFoundException.*drive with the name '([A-Z])'"
+            Diagnosis   = 'Absolute drive-letter path used in a script — fails on any runner that lacks that drive.'
+            Instruction = 'Replace all hardcoded drive-letter paths (e.g. E:\, C:\Users\...) with $PSScriptRoot-relative paths using Join-Path $PSScriptRoot.'
+        }
+        @{
+            Name        = 'ModuleNotFound'
+            Regex       = "ModuleNotFoundError|module '(.+?)' was not loaded because no valid module|Could not load the module named '(.+?)'"
+            Diagnosis   = 'A required PowerShell module is missing on the runner.'
+            Instruction = 'Add an Install-Module step to the workflow YAML before the step that uses the module.'
+        }
+        @{
+            Name        = 'CommandNotFound'
+            Regex       = "The term '(.+?)' is not recognized as a name of a cmdlet"
+            Diagnosis   = 'A command or function is called before its module is imported.'
+            Instruction = 'Ensure the module that provides the missing command is imported before it is called.'
+        }
+        @{
+            Name        = 'FileNotFound'
+            Regex       = "Cannot find path '(.+?)'|cannot access '(.+?)'|ItemNotFoundException"
+            Diagnosis   = 'A script references a file path that does not exist on the runner.'
+            Instruction = 'Verify the file exists in the repo and the path is correct relative to the working directory.'
+        }
+        @{
+            Name        = 'SecretMissing'
+            Regex       = "secret.*not set|GITHUB_TOKEN.*not set|A valid password is required"
+            Diagnosis   = 'A required secret or environment variable is not configured on the runner.'
+            Instruction = 'Add the secret in repo Settings > Secrets and reference it in the workflow env block.'
+        }
+    )
+
+    foreach ($p in $patterns) {
+        if ($LogText -match $p.Regex) {
+            return [PSCustomObject]@{
+                PatternName = $p.Name
+                Diagnosis   = $p.Diagnosis
+                Instruction = $p.Instruction
+                Matched     = $Matches[0]
+            }
+        }
+    }
+    return $null
+}
+
+function Invoke-ClaudeRepair {
+    param([string]$LogText, [string]$RepoPath, [string]$FailedFile)
+
+    # Uses the active Claude Code CLI session -- no API key required
+    if (-not (Get-Command claude -ErrorAction SilentlyContinue)) {
+        throw 'Claude Code CLI (claude) not found in PATH. Install from https://claude.ai/code and log in.'
+    }
+
+    $fileContext = ''
+    if ($FailedFile -and $RepoPath) {
+        $localFile = Join-Path $RepoPath $FailedFile
+        if (Test-Path $localFile) {
+            $fileContext = "`n`nFILE CONTENT ($FailedFile):`n" + (Get-Content $localFile -Raw)
+        }
+    }
+
+    $prompt = "Analyze this GitHub Actions failure and return a JSON repair plan.`n`nFAILURE LOG:`n$LogText$fileContext`n`nReturn ONLY a raw JSON object, no markdown fences, no text outside the JSON:`n{`"diagnosis`":`"one sentence root cause`",`"severity`":`"low|medium|high`",`"fixes`":[{`"file`":`"relative/path`",`"description`":`"what changes`",`"search`":`"exact string to find`",`"replace`":`"replacement`"}],`"commit_message`":`"fix: description`"}"
+
+    $rawResponse = ($prompt | & claude --print 2>&1) -join "`n"
+
+    if ($rawResponse -match '(?s)\{.*\}') {
+        return ($Matches[0] | ConvertFrom-Json)
+    }
+    throw "Could not parse JSON from Claude Code response.`nRaw: $rawResponse"
+}
+
 function Write-AuditEntry {
     param([string]$Action, [string]$Target, [string]$Result)
     try {
@@ -304,6 +398,251 @@ function Start-ControlPanel {
     }
 
     & $scriptPath -Port $Port
+}
+
+#endregion
+
+#region Get-WorkflowFailures
+
+function Get-WorkflowFailures {
+<#
+.SYNOPSIS
+    Returns recent failed GitHub Actions runs across configured repositories.
+
+.DESCRIPTION
+    Queries the GitHub Actions API for failed workflow runs in each repository.
+    For each failure it fetches the failed job details and a truncated log
+    excerpt, returning a structured object ready for piping into
+    Repair-FailedWorkflow.
+
+.PARAMETER Repository
+    One or more repositories in owner/repo format. Defaults to the list in
+    DevControlPlane.config.json.
+
+.PARAMETER MaxRuns
+    Maximum number of recent runs to inspect per repository. Default: 5.
+
+.EXAMPLE
+    Get-WorkflowFailures
+    Returns failures across all configured repositories.
+
+.EXAMPLE
+    Get-WorkflowFailures -Repository 'RobertKimutai-DS/DevControlPlane'
+    Returns failures for a single repository.
+
+.EXAMPLE
+    Get-WorkflowFailures | Repair-FailedWorkflow -RepoPath 'E:\career\DevControlPlane' -AutoCommit
+    Full automated repair pipeline.
+#>
+    [CmdletBinding()]
+    [OutputType([PSCustomObject])]
+    param(
+        [ValidatePattern('^[^/]+/[^/]+$')]
+        [string[]]$Repository,
+        [int]$MaxRuns = 5
+    )
+
+    $token = Get-GitHubToken
+    if (-not $token) { throw 'GitHub token unavailable. Store it with: Set-Secret -Name GitHubToken -Vault DevVault -Secret <token>' }
+
+    [array]$repoList = if ($Repository) {
+        $Repository
+    } elseif ($env:GITHUB_REPOSITORY) {
+        $env:GITHUB_REPOSITORY
+    } elseif ($script:Config -and $script:Config.repositories) {
+        $script:Config.repositories
+    } else {
+        throw 'No repositories configured. Pass -Repository or set DevControlPlane.config.json.'
+    }
+
+    $headers = @{ Authorization = "Bearer $token"; Accept = 'application/vnd.github+json' }
+
+    [array]$failures = foreach ($repo in $repoList) {
+        try {
+            $runs = (Invoke-RestMethod `
+                -Uri "https://api.github.com/repos/$repo/actions/runs?per_page=$MaxRuns&status=failure" `
+                -Headers $headers -ErrorAction Stop).workflow_runs
+
+            foreach ($run in $runs) {
+                $jobs = (Invoke-RestMethod `
+                    -Uri "https://api.github.com/repos/$repo/actions/runs/$($run.id)/jobs" `
+                    -Headers $headers -ErrorAction Stop).jobs
+
+                foreach ($job in ($jobs | Where-Object { $_.conclusion -eq 'failure' })) {
+                    $logText  = Get-WorkflowJobLogs -Repo $repo -JobId $job.id -Token $token
+                    $pattern  = Get-PatternFix -LogText $logText
+                    $failFile = if ($logText -match '[\\/]([\w.-]+\.ps1):\d+') { $Matches[1] } else { $null }
+
+                    [PSCustomObject]@{
+                        Repository    = $repo
+                        RunId         = $run.id
+                        WorkflowName  = $run.name
+                        Branch        = $run.head_branch
+                        CommitSha     = $run.head_sha.Substring(0, 7)
+                        CreatedAt     = $run.created_at
+                        JobId         = $job.id
+                        JobName       = $job.name
+                        FailedSteps   = @($job.steps | Where-Object { $_.conclusion -eq 'failure' } | Select-Object -ExpandProperty name)
+                        LogExcerpt    = ($logText -split "`n" | Where-Object { $_ -match 'error|fail|exception|cannot|not found' } | Select-Object -First 15) -join "`n"
+                        FullLog       = $logText
+                        KnownPattern  = $pattern
+                        FailedFile    = $failFile
+                        HtmlUrl       = $run.html_url
+                    }
+                }
+            }
+        } catch {
+            Write-Warning "Could not fetch failures for ${repo}: $_"
+        }
+    }
+
+    if (-not $failures) {
+        Write-Host 'No failed runs found across configured repositories.' -ForegroundColor Green
+    }
+
+    $failures
+}
+
+#endregion
+
+#region Repair-FailedWorkflow
+
+function Repair-FailedWorkflow {
+<#
+.SYNOPSIS
+    Diagnoses and repairs a GitHub Actions workflow failure.
+
+.DESCRIPTION
+    Accepts a failure object from Get-WorkflowFailures (or pipeline input).
+    First tries a pattern engine covering common CI failures (hardcoded paths,
+    missing modules, missing secrets, command-not-found). If no pattern matches,
+    sends the failure log and relevant file content to Claude API for an
+    AI-generated fix. Applies the fix to the local repo files. Use -AutoCommit
+    to automatically git add, commit, and push.
+
+.PARAMETER Failure
+    A failure object from Get-WorkflowFailures. Accepts pipeline input.
+
+.PARAMETER RepoPath
+    Local path to the git repository root. Defaults to the current directory.
+
+.PARAMETER AutoCommit
+    When set, automatically stages, commits, and pushes fixed files.
+
+.EXAMPLE
+    Get-WorkflowFailures -Repository 'RobertKimutai-DS/DevControlPlane' | Repair-FailedWorkflow -RepoPath 'E:\career\DevControlPlane'
+    Diagnoses and repairs all failures, showing a diff for review.
+
+.EXAMPLE
+    Get-WorkflowFailures | Repair-FailedWorkflow -RepoPath 'E:\career\DevControlPlane' -AutoCommit
+    Full automated repair and push.
+#>
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    param(
+        [Parameter(Mandatory, ValueFromPipeline)]
+        [PSCustomObject]$Failure,
+
+        [string]$RepoPath = (Get-Location).Path,
+
+        [switch]$AutoCommit
+    )
+
+    process {
+        Write-Host "`n[$($Failure.Repository)] $($Failure.WorkflowName) @ $($Failure.CommitSha)" -ForegroundColor Cyan
+        Write-Host "  Job     : $($Failure.JobName)" -ForegroundColor DarkCyan
+        Write-Host "  Steps   : $($Failure.FailedSteps -join ', ')" -ForegroundColor DarkCyan
+        Write-Host "  URL     : $($Failure.HtmlUrl)" -ForegroundColor DarkCyan
+
+        # --- Try pattern engine first ---
+        $repair = $null
+
+        if ($Failure.KnownPattern) {
+            $p = $Failure.KnownPattern
+            Write-Host "`n  Pattern : $($p.PatternName)" -ForegroundColor Yellow
+            Write-Host "  Diagnosis: $($p.Diagnosis)" -ForegroundColor Yellow
+            Write-Host "  Sending to Claude Code for file-specific fix..." -ForegroundColor DarkYellow
+
+            try {
+                $repair = Invoke-ClaudeRepair -LogText $Failure.FullLog -RepoPath $RepoPath -FailedFile $Failure.FailedFile
+                $repair | Add-Member -NotePropertyName 'Source' -NotePropertyValue 'Pattern+Claude'
+            } catch {
+                Write-Warning "Claude API unavailable: $_"
+                $repair = [PSCustomObject]@{
+                    Source        = 'PatternOnly'
+                    diagnosis     = $p.Diagnosis
+                    severity      = 'medium'
+                    fixes         = @()
+                    commit_message = "fix: $($p.PatternName -creplace '([A-Z])',' $1').Trim().ToLower()"
+                    Instruction   = $p.Instruction
+                }
+            }
+        } else {
+            Write-Host "`n  No known pattern matched. Sending to Claude Code for analysis..." -ForegroundColor Magenta
+            try {
+                $repair = Invoke-ClaudeRepair -LogText $Failure.FullLog -RepoPath $RepoPath -FailedFile $Failure.FailedFile
+                $repair | Add-Member -NotePropertyName 'Source' -NotePropertyValue 'Claude'
+            } catch {
+                Write-Warning "Claude API unavailable: $_"
+                Write-Host "`n  Log excerpt for manual review:" -ForegroundColor Red
+                Write-Host $Failure.LogExcerpt -ForegroundColor DarkRed
+                return [PSCustomObject]@{ Repository = $Failure.Repository; Status = 'ManualReviewRequired'; Repair = $null }
+            }
+        }
+
+        Write-Host "`n  Diagnosis : $($repair.diagnosis)" -ForegroundColor White
+        Write-Host "  Severity  : $($repair.severity)" -ForegroundColor White
+
+        # --- Apply fixes ---
+        $appliedFixes = @()
+
+        foreach ($fix in $repair.fixes) {
+            $targetFile = Join-Path $RepoPath $fix.file
+            if (-not (Test-Path $targetFile)) {
+                Write-Warning "  File not found locally: $targetFile — skipping fix."
+                continue
+            }
+
+            if ($PSCmdlet.ShouldProcess($targetFile, "Apply fix: $($fix.description)")) {
+                $current = Get-Content $targetFile -Raw
+                if ($fix.search -and $current -match [regex]::Escape($fix.search)) {
+                    $updated = $current.Replace($fix.search, $fix.replace)
+                    Set-Content -Path $targetFile -Value $updated -Encoding UTF8 -NoNewline
+                    Write-Host "  FIXED : $($fix.file) — $($fix.description)" -ForegroundColor Green
+                    $appliedFixes += $targetFile
+                } else {
+                    Write-Warning "  SKIPPED: Search string not found in $($fix.file)"
+                }
+            }
+        }
+
+        # --- Auto-commit ---
+        if ($AutoCommit -and $appliedFixes.Count -gt 0) {
+            if ($PSCmdlet.ShouldProcess($RepoPath, "git add, commit, and push")) {
+                Push-Location $RepoPath
+                try {
+                    $appliedFixes | ForEach-Object { git add $_ 2>$null }
+                    $msg = if ($repair.commit_message) { $repair.commit_message } else { "fix: auto-repair CI failure in $($Failure.Repository)" }
+                    git commit -m $msg 2>$null
+                    git push 2>$null
+                    Write-Host "  PUSHED: $msg" -ForegroundColor Green
+                } finally {
+                    Pop-Location
+                }
+            }
+        } elseif ($appliedFixes.Count -gt 0) {
+            Write-Host "  Review changes then run: git add, git commit, git push" -ForegroundColor DarkYellow
+        }
+
+        [PSCustomObject]@{
+            Repository    = $Failure.Repository
+            Status        = if ($appliedFixes.Count -gt 0) { 'Fixed' } elseif ($repair.fixes.Count -eq 0) { 'DiagnosisOnly' } else { 'SkippedFileNotFound' }
+            Source        = $repair.Source
+            Diagnosis     = $repair.diagnosis
+            Severity      = $repair.severity
+            FilesFixed    = $appliedFixes
+            CommitMessage = $repair.commit_message
+        }
+    }
 }
 
 #endregion

@@ -6,8 +6,10 @@
     "RobertKimutai-DS/Portfolio",
     "RobertKimutai-DS/RobertKimutai-DS",
     "RobertKimutai-DS/SmartLicenSync",
-    "RobertKimutai-DS/shaSystem"
+    "RobertKimutai-DS/shaSystem",
+    "RobertKimutai-DS/DevControlPlane"
   ],
   "apiKey": "dev-control-plane-local-key-change-me",
-  "port": 8080
+  "port": 8080,
+  "localRepoPath": "E:\\career\\DevControlPlane"
 }

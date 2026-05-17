@@ -24,8 +24,10 @@ $block = @"
 $sentinel
 # DevControlPlane — auto-injected by ProfileConfig.ps1
 Import-Module DevControlPlane -Force -ErrorAction SilentlyContinue
-Set-Alias -Name dstatus -Value Get-DevWorkspaceStatus -Scope Global -Force -ErrorAction SilentlyContinue
-Set-Alias -Name dclean  -Value Optimize-DevWorkspace  -Scope Global -Force -ErrorAction SilentlyContinue
+Set-Alias -Name dstatus  -Value Get-DevWorkspaceStatus  -Scope Global -Force -ErrorAction SilentlyContinue
+Set-Alias -Name dclean   -Value Optimize-DevWorkspace   -Scope Global -Force -ErrorAction SilentlyContinue
+Set-Alias -Name wfail    -Value Get-WorkflowFailures    -Scope Global -Force -ErrorAction SilentlyContinue
+Set-Alias -Name wrepair  -Value Repair-FailedWorkflow   -Scope Global -Force -ErrorAction SilentlyContinue
 function global:cctx {
     `$script = Join-Path (Split-Path (Get-Module DevControlPlane).Path) 'Invoke-ClaudeContext.ps1'
     & `$script @args

@@ -1,5 +1,5 @@
 @{
-    ModuleVersion     = '1.1.0'
+    ModuleVersion     = '1.2.0'
     GUID              = 'a3f1c2d4-5e6b-7890-abcd-ef1234567890'
     Author            = 'Robert Kimutai'
     CompanyName       = 'DevControlPlane'
@@ -12,7 +12,9 @@
     FunctionsToExport = @(
         'Get-DevWorkspaceStatus',
         'Optimize-DevWorkspace',
-        'Start-ControlPanel'
+        'Start-ControlPanel',
+        'Get-WorkflowFailures',
+        'Repair-FailedWorkflow'
     )
 
     CmdletsToExport   = @()
