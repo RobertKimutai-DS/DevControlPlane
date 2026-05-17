@@ -1,0 +1,13 @@
+{
+  "repositories": [
+    "RobertKimutai-DS/dairy-management",
+    "RobertKimutai-DS/uon-msc-thesis",
+    "RobertKimutai-DS/uon-msc-thesis-claude",
+    "RobertKimutai-DS/Portfolio",
+    "RobertKimutai-DS/RobertKimutai-DS",
+    "RobertKimutai-DS/SmartLicenSync",
+    "RobertKimutai-DS/shaSystem"
+  ],
+  "apiKey": "dev-control-plane-local-key-change-me",
+  "port": 8080
+}

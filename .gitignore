@@ -1,0 +1,13 @@
+# Generated output
+.claude-context.md
+
+# Audit logs
+logs/
+
+# Secrets — never commit
+*.key
+*.secret
+secrets.json
+
+# PowerShell temp
+*.ps1xml
