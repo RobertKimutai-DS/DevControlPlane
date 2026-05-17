@@ -2,8 +2,7 @@
 
 BeforeAll {
     Import-Module Pester -MinimumVersion 5.0 -Force
-    $manifestPath = 'E:\career\DevControlPlane\DevControlPlane.psd1'
-    $modulePath   = 'E:\career\DevControlPlane\DevControlPlane.psm1'
+    $manifestPath = Join-Path $PSScriptRoot 'DevControlPlane.psd1'
     Remove-Module DevControlPlane -Force -ErrorAction SilentlyContinue
     Import-Module $manifestPath -Force
 }
@@ -12,7 +11,7 @@ BeforeAll {
 Describe 'Module Manifest' {
 
     BeforeAll {
-        $script:manifest = Import-PowerShellDataFile 'E:\career\DevControlPlane\DevControlPlane.psd1'
+        $script:manifest = Import-PowerShellDataFile (Join-Path $PSScriptRoot 'DevControlPlane.psd1')
     }
 
     It 'exports Get-DevWorkspaceStatus' {
@@ -123,14 +122,12 @@ Describe 'Get-DevWorkspaceStatus' {
             Remove-Item Env:\GITHUB_REPOSITORY -ErrorAction SilentlyContinue
             $r = Get-DevWorkspaceStatus
             $env:GITHUB_REPOSITORY = $saved
-            # Either an error is set or GitHubActions has data — one must be true
             ($r.GitHubActionsError -or $r.GitHubActions) | Should -BeTrue
         }
 
         It 'GitHubActions returns a result with Repository property when repo is specified' {
             $r = Get-DevWorkspaceStatus -Repository 'RobertKimutai-DS/Portfolio'
             $r.GitHubActions | Should -Not -BeNullOrEmpty
-            # Access first element safely regardless of array vs object
             (@($r.GitHubActions))[0].Repository | Should -Be 'RobertKimutai-DS/Portfolio'
         }
     }
@@ -146,7 +143,7 @@ Describe 'Optimize-DevWorkspace' {
         }
 
         It 'does not write an audit log entry when run with -WhatIf' {
-            $logFile = 'E:\career\DevControlPlane\logs\cleanup-audit.log'
+            $logFile = Join-Path $PSScriptRoot 'logs\cleanup-audit.log'
             $before  = if (Test-Path $logFile) { (Get-Item $logFile).LastWriteTime } else { $null }
             Optimize-DevWorkspace -WhatIf
             $after   = if (Test-Path $logFile) { (Get-Item $logFile).LastWriteTime } else { $null }
@@ -180,7 +177,6 @@ Describe 'Start-ControlPanel port validation' {
     }
 
     It 'accepts a valid port in range' {
-        # Only test parameter acceptance — do not start the server
         $cmd = Get-Command Start-ControlPanel
         $portParam = $cmd.Parameters['Port']
         $portParam | Should -Not -BeNullOrEmpty
