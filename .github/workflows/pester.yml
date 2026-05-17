@@ -50,11 +50,12 @@ jobs:
       - name: Copy module to PSModulePath
         shell: pwsh
         run: |
-          $dst = "$HOME\Documents\PowerShell\Modules\DevControlPlane\1.1.0"
+          $version = (Import-PowerShellDataFile '.\DevControlPlane.psd1').ModuleVersion
+          $dst = "$HOME\Documents\PowerShell\Modules\DevControlPlane\$version"
           New-Item -ItemType Directory -Path $dst -Force | Out-Null
           Copy-Item DevControlPlane.psd1, DevControlPlane.psm1, Start-ControlPanel.ps1,
                     Invoke-ClaudeContext.ps1, DevControlPlane.config.json $dst -Force
-          Write-Host "Module installed to $dst"
+          Write-Host "Module v$version installed to $dst"
 
       - name: Run Pester tests
         shell: pwsh
